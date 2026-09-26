@@ -34,17 +34,49 @@ With `expandPromptTemplates: true`, `session.prompt()` routes any `/command` tex
 > [`@llblab/pi-telegram`](https://www.npmjs.com/package/@llblab/pi-telegram) npm package.
 > (There are multiple packages named "pi-telegram" out there; this one targets llblab's.)
 
+### `unsloth-sync.ts` — live Unsloth Studio model discovery
+
+Pi never refreshes static `models.json` provider entries by itself, so a model you load in
+Unsloth Studio (or a new context size) stays invisible until you edit `models.json` by hand.
+This extension does that live, from the running Studio server:
+
+| Source | Fields read | Mapped to |
+|---|---|---|
+| `GET /v1/models` | `id`, `display_name`, `quant`, `loaded`, `context_length`, `max_context_length`, `native_context_length` | `contextWindow` (first present of `contextPreference`) |
+| `GET /api/models/list` | `is_vision`, `is_lora` | `input: ["text","image"]`; LoRA rows and GGUF shard rows (`-00001-of-00002`) are skipped |
+
+Manual entries already in `models.json` always win for the same model ID — pi composes
+`models.json` overrides above extension-registered models, so this file only adds new models
+and fills missing metadata. A cache (`~/.pi/agent/pi-on-the-go-cache.json`) is used when the
+server is offline.
+
+**Reachable without slash commands** (Telegram has no command palette):
+
+| You say | What happens |
+|---|---|
+| `aggiornamento unsloth` / `aggiorna i modelli unsloth` / `sincronizza unsloth` | sync runs deterministically in the `input` event, the reply reports the result |
+| `refresh unsloth` / `unsloth sync` / `update unsloth models` | same, English variants |
+| `/unsloth [refresh\|list\|status]` | TUI command |
+| tool `unsloth_sync` | the agent can call it on its own |
+
+Trigger matching is limited to short messages (≤ 80 chars) so normal conversation is never hijacked.
+Note: the discovery endpoints require the API key (`401` otherwise), while chat completions accept
+the placeholder key in `models.json`. The extension reads the key from config → env → key file →
+`models.json`, in that order.
+
+Config (optional, `~/.pi/agent/pi-on-the-go.json`) — see [`examples/pi-on-the-go.json`](examples/pi-on-the-go.json).
+
 ## Install
 
-Copy the file into your global extensions folder:
+Copy the files into your global extensions folder:
 
 ```bash
-cp tg-session-ctl.ts ~/.pi/agent/extensions/
+cp tg-session-ctl.ts unsloth-sync.ts ~/.pi/agent/extensions/
 ```
 
 Then in pi run `/reload` (or, once the extension is active, just ask the agent *"reload"* — nice recursion).
 
-No dependencies beyond what pi already provides (`@earendil-works/pi-coding-agent` types + `typebox`, plus Node built-ins `fs`/`os`/`path`).
+No dependencies beyond what pi already provides (`@earendil-works/pi-coding-agent` types + `typebox`, plus Node built-ins `fs`/`os`/`path` — no runtime import of `pi-ai`, so loading through jiti works).
 
 ## Examples (Windows)
 

@@ -1,0 +1,11 @@
+{
+  "provider": "unsloth",
+  "baseUrl": "http://127.0.0.1:8888/v1",
+  "apiKey": "",
+  "keyFile": "~/.pi/agent/skills/unsloth-rag/api_key.txt",
+  "cacheFile": "~/.pi/agent/pi-on-the-go-cache.json",
+  "autoRefreshOnStart": true,
+  "defaultReasoning": false,
+  "maxTokens": 8192,
+  "contextPreference": ["context_length", "native_context_length", "max_context_length", "max_position_embeddings"]
+}
