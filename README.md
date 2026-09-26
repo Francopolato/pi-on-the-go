@@ -45,11 +45,14 @@ This extension does that live, from the running Studio server:
 | `GET /v1/models` | `id`, `display_name`, `quant`, `loaded`, `context_length`, `max_context_length`, `native_context_length` | `contextWindow` (first present of `contextPreference`, then `contextOverrides[matchKey]`) |
 | `GET /api/models/list` | `is_vision`, `is_lora` | `input: ["text","image"]`; LoRA rows and GGUF shard rows (`-00001-of-00002`) are skipped |
 
-Manual entries already in `models.json` always win for the same model ID — pi composes
-`models.json` overrides above extension-registered models, so this file only adds new models
-and fills missing metadata. The extension **never writes** `models.json`: its models live only
-in the runtime registry of the session. A cache (`~/.pi/agent/pi-on-the-go-cache.json`) is used
-when the server is offline.
+Manual entries in `models.json` are re-included in the provider list (pi's `applyExtension`
+replaces the whole provider model list with what the extension returns, so without this the manual
+models would disappear). Every live row is registered as a **clone** named
+`<display_name><liveSuffix>` (default `_live`), so a model you loaded in Studio with custom values
+is selectable next to its manual entry. On an *exact* ID collision the live values win — that is the
+point of the extension. The extension **never writes** `models.json`: everything lives only in the
+runtime registry of the session. A cache (`~/.pi/agent/pi-on-the-go-cache.json`) is used when the
+server is offline.
 
 **Context rules — no invented numbers:**
 
@@ -59,11 +62,11 @@ when the server is offline.
 - Studio exposes `context_length` only for **loaded** models, so unloaded ones need an override or a
   manual entry.
 
-**No twins:** pi merges `models.json` entries by *exact* ID, so `X`, `X/file` and `X:quant` are three
-different IDs. The extension keys live rows by a normalized match key (path prefix and `:quant` suffix
-stripped, lowercased), collapses duplicate live rows of the same model into one entry, and skips any row
-whose key matches a manual entry — including entries in other provider blocks that resolve to this
-provider through `"provider": "unsloth"`.
+**Clone naming:** the clone keeps the real server name as `id` — pi sends `model: model.id` to the
+OpenAI-compatible endpoint, so suffixing the ID would break requests; `_live` lives in `name` only.
+`X`, `X/file` and `X:quant` are still three different IDs, so duplicate live rows of the same model
+collapse to one entry through a normalized match key (path prefix and `:quant` suffix stripped,
+lowercased) — the same key used for `contextOverrides` lookups.
 
 **Reachable without slash commands** (Telegram has no command palette):
 

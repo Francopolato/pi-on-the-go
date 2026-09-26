@@ -19,14 +19,16 @@
  *                   expose a thinking block unless the model is a reasoning model)
  *   maxTokens     = cfg.maxTokens (capped to contextWindow)
  *
- * Manual entries already present in `models.json` always win for the same model ID —
- * pi composes models.json overrides above extension-registered models, so this file
- * only adds new models and fills missing metadata. The extension never writes
- * `models.json`; its models exist only in the runtime registry (session). To avoid
- * twins, live rows whose normalized key matches a manual entry are not registered
- * (entries in the provider's own block OR entries in other blocks that resolve to it
- * via `"provider": "unsloth"`), and duplicate live rows of the same model ("X" vs
- * "X/file") collapse to one entry.
+ * Every live row is registered as a runtime clone named `<display_name><liveSuffix>`
+ * (default `_live`), so a model loaded in Studio with custom parameters is visible and
+ * selectable next to the manual `models.json` entry for the same model. The extension
+ * never writes `models.json`; its models exist only in the runtime registry (session).
+ *
+ * IMPORTANT: the clone keeps the real server id as `id` — pi sends `model: model.id` to
+ * the OpenAI-compatible endpoint, so suffixing the ID would break requests. The `_live`
+ * marker lives in `name` only. Duplicate live rows of the same model ("X" vs "X/file")
+ * still collapse to one entry; when a live row has the exact same id as a manual entry,
+ * pi merges them and the live values win.
  *
  * Reachable WITHOUT slash commands (Telegram has no command palette):
  *   - natural language: "aggiornamento unsloth", "aggiorna i modelli unsloth",
@@ -60,6 +62,7 @@ interface Cfg {
 	maxTokens: number;
 	contextPreference: string[];
 	contextOverrides: Record<string, number>;
+	liveSuffix: string;
 }
 
 interface StudioModel {
@@ -106,6 +109,7 @@ const DEFAULTS: Cfg = {
 	maxTokens: 8192,
 	contextPreference: ["context_length", "native_context_length", "max_context_length", "max_position_embeddings"],
 	contextOverrides: {},
+	liveSuffix: "_live",
 };
 
 // Natural-language triggers (Telegram has no slash commands). Matched only on short
@@ -150,34 +154,46 @@ function matchKey(id: string): string {
 	return basename(normalizeModelKey(id)).toLowerCase().trim();
 }
 
-function manualKeys(cfg: Cfg): Set<string> {
+// Key used to collapse duplicate live rows of the same model ("X" vs "X/file") and to
+// look up contextOverrides. Manual entries are NOT skipped anymore: a live row is always
+// registered as a `_live` clone so custom Studio values stay selectable in the session.
+function dedupe(models: ProviderModelConfig[]): ProviderModelConfig[] {
+	const seen = new Map<string, ProviderModelConfig>();
+	for (const m of models) {
+		const k = matchKey(m.id);
+		if (!seen.has(k)) seen.set(k, m);
+	}
+	return [...seen.values()];
+}
+
+// Manual entries from models.json for this provider (own block OR entries in other blocks
+// that resolve to it via "provider"). pi's applyExtension replaces the whole provider list
+// with what the extension returns, so these must be re-included or they disappear.
+function manualModels(cfg: Cfg): ProviderModelConfig[] {
 	const modelsJson = readJson(path.join(AGENT_DIR, "models.json"));
 	const providers = (modelsJson?.providers ?? {}) as Record<string, unknown>;
-	const keys = new Set<string>();
+	const out: ProviderModelConfig[] = [];
 	for (const [pname, block] of Object.entries(providers)) {
 		if (!block || typeof block !== "object") continue;
 		const list = (block as { models?: unknown }).models;
 		if (!Array.isArray(list)) continue;
 		for (const raw of list) {
 			if (!raw || typeof raw !== "object") continue;
-			const entry = raw as { id?: unknown; provider?: unknown };
+			const entry = raw as ProviderModelConfig & { provider?: string };
 			if (typeof entry.id !== "string") continue;
-			// own block, or another block whose entry explicitly resolves to this provider
-			if (pname === cfg.provider || entry.provider === cfg.provider) keys.add(matchKey(entry.id));
+			if (pname === cfg.provider || entry.provider === cfg.provider) out.push({ ...entry, provider: cfg.provider });
 		}
 	}
-	return keys;
+	return out;
 }
 
-function dedupe(models: ProviderModelConfig[], cfg: Cfg): ProviderModelConfig[] {
-	const manual = manualKeys(cfg);
-	const seen = new Map<string, ProviderModelConfig>();
-	for (const m of models) {
-		const k = matchKey(m.id);
-		if (manual.has(k)) continue; // manual entry wins: never register a twin
-		if (!seen.has(k)) seen.set(k, m);
-	}
-	return [...seen.values()];
+// Manual entries + live clones; on an exact-id collision the live values win (that is the
+// point of the extension: pick up the custom context loaded in Studio).
+function compose(cfg: Cfg, live: ProviderModelConfig[]): ProviderModelConfig[] {
+	const byId = new Map<string, ProviderModelConfig>();
+	for (const m of manualModels(cfg)) byId.set(m.id, m);
+	for (const m of dedupe(live)) byId.set(m.id, m);
+	return [...byId.values()];
 }
 
 function loadConfig(): Cfg {
@@ -198,6 +214,7 @@ function loadConfig(): Cfg {
 	if (typeof userCfg.defaultReasoning === "boolean") cfg.defaultReasoning = userCfg.defaultReasoning;
 	if (typeof userCfg.maxTokens === "number") cfg.maxTokens = userCfg.maxTokens;
 	if (Array.isArray(userCfg.contextPreference)) cfg.contextPreference = userCfg.contextPreference;
+	if (typeof userCfg.liveSuffix === "string") cfg.liveSuffix = userCfg.liveSuffix;
 	if (userCfg.contextOverrides && typeof userCfg.contextOverrides === "object") {
 		const ov: Record<string, number> = {};
 		for (const [k, v] of Object.entries(userCfg.contextOverrides)) {
@@ -273,7 +290,7 @@ function toModelConfig(m: StudioModel, caps: Capabilities | undefined, cfg: Cfg)
 	const input = caps?.vision ? ["text", "image"] : ["text"];
 	return {
 		id: m.id,
-		name: m.display_name || basename(normalizeModelKey(m.id)) || m.id,
+		name: `${m.display_name || basename(normalizeModelKey(m.id)) || m.id}${cfg.liveSuffix}`,
 		reasoning: cfg.defaultReasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -325,13 +342,11 @@ async function discover(cfg: Cfg, signal?: AbortSignal): Promise<DiscoveryResult
 	const caps = buildCapabilitiesMap(Array.isArray(list?.models) ? list.models : []);
 
 	// GGUF shard rows ("...-00001-of-00002") and LoRA adapters are not chat models.
-	const manual = manualKeys(cfg);
 	const byKey = new Map<string, StudioModel>();
 	for (const m of all) {
 		if (/[-_]\d{4,6}-of-\d{4,6}$/i.test(m.id)) continue;
 		if (lookupCaps(caps, m.id)?.lora) continue;
 		const k = matchKey(m.id);
-		if (manual.has(k)) continue; // models.json entry already covers this model
 		const prev = byKey.get(k);
 		if (!prev || (prev.id.includes("/") && !m.id.includes("/"))) byKey.set(k, m);
 	}
@@ -362,10 +377,10 @@ async function discover(cfg: Cfg, signal?: AbortSignal): Promise<DiscoveryResult
 
 function formatReport(cfg: Cfg, result: DiscoveryResult, limit = 12): string {
 	const lines: string[] = [];
-	const models = dedupe(result.models, cfg);
+	const models = dedupe(result.models);
 	lines.push(
 		`${cfg.provider} (${result.source}${result.updatedAt ? ` @ ${result.updatedAt}` : ""}) — ` +
-			`${models.length} modelli con contesto reale, ${result.stats.vision} vision, ` +
+			`${models.length} cloni live con contesto reale, ${result.stats.vision} vision, ` +
 			`${result.stats.loaded} caricati, ${result.stats.skipped ?? 0} saltati (nessun ctx: ` +
 			`aggiungi contextOverrides o entry in models.json).`,
 	);
@@ -415,13 +430,13 @@ export default function (pi: ExtensionAPI) {
 		baseUrl: cfg.baseUrl,
 		apiKey: cfg.apiKey,
 		api: "openai-completions",
-		models: dedupe(readCache(cfg)?.models ?? [], cfg),
+		models: compose(cfg, readCache(cfg)?.models ?? []),
 		async refreshModels(context: { allowNetwork?: boolean; signal?: AbortSignal }) {
 			if (!context?.allowNetwork) return readCache(cfg)?.models ?? [];
 			try {
 				const result = await discover(cfg, context?.signal);
 				last = result;
-				return result.models;
+				return compose(cfg, result.models);
 			} catch (err) {
 				console.error("[unsloth-sync] refreshModels:", err instanceof Error ? err.message : String(err));
 				return readCache(cfg)?.models ?? [];
@@ -465,7 +480,8 @@ export default function (pi: ExtensionAPI) {
 			const mode = (args || "").trim().toLowerCase();
 			let result: DiscoveryResult;
 			try {
-				result = mode === "status" && last ? last : readCache(cfg) ?? (await runSync(cfg));
+				// refresh must hit the live server; only status may answer from cache.
+			result = mode === "status" && last ? last : await runSync(cfg);
 			} catch (err) {
 				ctx.ui.notify(`unsloth sync fallito: ${err instanceof Error ? err.message : String(err)}`, "error");
 				return;
@@ -487,7 +503,8 @@ export default function (pi: ExtensionAPI) {
 			}),
 		}),
 		async execute(_toolCallId, params) {
-			const result = params.action === "status" && last ? last : readCache(cfg) ?? (await runSync(cfg));
+			// refresh must hit the live server; only status may answer from cache.
+			const result = params.action === "status" && last ? last : await runSync(cfg);
 			return { content: [{ type: "text", text: formatReport(cfg, result, 20) }], details: {} };
 		},
 	});
