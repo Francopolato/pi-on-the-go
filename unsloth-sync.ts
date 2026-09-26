@@ -11,7 +11,9 @@
  *
  * Mapping used (generic discovery extensions do NOT map these field names):
  *   contextWindow = first present of contextPreference (default:
- *                   context_length → native_context_length → max_context_length)
+ *                   context_length → native_context_length → max_context_length),
+ *                   then cfg.contextOverrides[matchKey]; NO fabricated fallback — a
+ *                   model with no real context info is skipped, never shown as 32768.
  *   input         = ["text","image"] when is_vision, else ["text"]
  *   reasoning     = cfg.defaultReasoning (false by default: GGUF chat endpoints do not
  *                   expose a thinking block unless the model is a reasoning model)
@@ -19,7 +21,12 @@
  *
  * Manual entries already present in `models.json` always win for the same model ID —
  * pi composes models.json overrides above extension-registered models, so this file
- * only adds new models and fills missing metadata.
+ * only adds new models and fills missing metadata. The extension never writes
+ * `models.json`; its models exist only in the runtime registry (session). To avoid
+ * twins, live rows whose normalized key matches a manual entry are not registered
+ * (entries in the provider's own block OR entries in other blocks that resolve to it
+ * via `"provider": "unsloth"`), and duplicate live rows of the same model ("X" vs
+ * "X/file") collapse to one entry.
  *
  * Reachable WITHOUT slash commands (Telegram has no command palette):
  *   - natural language: "aggiornamento unsloth", "aggiorna i modelli unsloth",
@@ -52,6 +59,7 @@ interface Cfg {
 	defaultReasoning: boolean;
 	maxTokens: number;
 	contextPreference: string[];
+	contextOverrides: Record<string, number>;
 }
 
 interface StudioModel {
@@ -77,6 +85,7 @@ interface Stats {
 	withContext: number;
 	vision: number;
 	loaded: number;
+	skipped: number;
 }
 
 interface DiscoveryResult {
@@ -96,6 +105,7 @@ const DEFAULTS: Cfg = {
 	defaultReasoning: false,
 	maxTokens: 8192,
 	contextPreference: ["context_length", "native_context_length", "max_context_length", "max_position_embeddings"],
+	contextOverrides: {},
 };
 
 // Natural-language triggers (Telegram has no slash commands). Matched only on short
@@ -134,6 +144,42 @@ function basename(p: string): string {
 	return p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 }
 
+// Key used to match live rows against models.json manual entries (pi merges by exact
+// id, so "X", "X/Y" and "X:quant" must collapse to the same key for dedup).
+function matchKey(id: string): string {
+	return basename(normalizeModelKey(id)).toLowerCase().trim();
+}
+
+function manualKeys(cfg: Cfg): Set<string> {
+	const modelsJson = readJson(path.join(AGENT_DIR, "models.json"));
+	const providers = (modelsJson?.providers ?? {}) as Record<string, unknown>;
+	const keys = new Set<string>();
+	for (const [pname, block] of Object.entries(providers)) {
+		if (!block || typeof block !== "object") continue;
+		const list = (block as { models?: unknown }).models;
+		if (!Array.isArray(list)) continue;
+		for (const raw of list) {
+			if (!raw || typeof raw !== "object") continue;
+			const entry = raw as { id?: unknown; provider?: unknown };
+			if (typeof entry.id !== "string") continue;
+			// own block, or another block whose entry explicitly resolves to this provider
+			if (pname === cfg.provider || entry.provider === cfg.provider) keys.add(matchKey(entry.id));
+		}
+	}
+	return keys;
+}
+
+function dedupe(models: ProviderModelConfig[], cfg: Cfg): ProviderModelConfig[] {
+	const manual = manualKeys(cfg);
+	const seen = new Map<string, ProviderModelConfig>();
+	for (const m of models) {
+		const k = matchKey(m.id);
+		if (manual.has(k)) continue; // manual entry wins: never register a twin
+		if (!seen.has(k)) seen.set(k, m);
+	}
+	return [...seen.values()];
+}
+
 function loadConfig(): Cfg {
 	const cfg: Cfg = { ...DEFAULTS };
 
@@ -152,6 +198,13 @@ function loadConfig(): Cfg {
 	if (typeof userCfg.defaultReasoning === "boolean") cfg.defaultReasoning = userCfg.defaultReasoning;
 	if (typeof userCfg.maxTokens === "number") cfg.maxTokens = userCfg.maxTokens;
 	if (Array.isArray(userCfg.contextPreference)) cfg.contextPreference = userCfg.contextPreference;
+	if (userCfg.contextOverrides && typeof userCfg.contextOverrides === "object") {
+		const ov: Record<string, number> = {};
+		for (const [k, v] of Object.entries(userCfg.contextOverrides)) {
+			if (typeof v === "number" && v > 0) ov[String(k).toLowerCase().trim()] = v;
+		}
+		cfg.contextOverrides = ov;
+	}
 
 	// Env overrides the config file.
 	if (process.env.UNSLOTH_BASE_URL) cfg.baseUrl = process.env.UNSLOTH_BASE_URL;
@@ -211,11 +264,12 @@ function pickContext(m: StudioModel, cfg: Cfg): number | undefined {
 		const v = (m as any)[field];
 		if (typeof v === "number" && v > 0) return v;
 	}
-	return undefined;
+	return cfg.contextOverrides[matchKey(m.id)];
 }
 
-function toModelConfig(m: StudioModel, caps: Capabilities | undefined, cfg: Cfg): ProviderModelConfig {
+function toModelConfig(m: StudioModel, caps: Capabilities | undefined, cfg: Cfg): ProviderModelConfig | null {
 	const ctx = pickContext(m, cfg);
+	if (!ctx) return null; // no invented context size: skipped, not defaulted
 	const input = caps?.vision ? ["text", "image"] : ["text"];
 	return {
 		id: m.id,
@@ -223,8 +277,8 @@ function toModelConfig(m: StudioModel, caps: Capabilities | undefined, cfg: Cfg)
 		reasoning: cfg.defaultReasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: ctx ?? 32768,
-		maxTokens: Math.min(cfg.maxTokens, ctx ?? cfg.maxTokens),
+		contextWindow: ctx,
+		maxTokens: Math.min(cfg.maxTokens, ctx),
 	};
 }
 
@@ -235,7 +289,7 @@ function readCache(cfg: Cfg): DiscoveryResult | null {
 		models: raw.models as ProviderModelConfig[],
 		source: "cache",
 		updatedAt: raw.updatedAt,
-		stats: raw.stats ?? { total: raw.models.length, withContext: 0, vision: 0, loaded: 0 },
+		stats: raw.stats ?? { total: raw.models.length, withContext: 0, vision: 0, loaded: 0, skipped: 0 },
 	};
 }
 
@@ -271,17 +325,34 @@ async function discover(cfg: Cfg, signal?: AbortSignal): Promise<DiscoveryResult
 	const caps = buildCapabilitiesMap(Array.isArray(list?.models) ? list.models : []);
 
 	// GGUF shard rows ("...-00001-of-00002") and LoRA adapters are not chat models.
-	const raw = all.filter((m) => {
-		if (/[-_]\d{4,6}-of-\d{4,6}$/i.test(m.id)) return false;
-		return !lookupCaps(caps, m.id)?.lora;
-	});
-	const models = raw.map((m) => toModelConfig(m, lookupCaps(caps, m.id), cfg));
+	const manual = manualKeys(cfg);
+	const byKey = new Map<string, StudioModel>();
+	for (const m of all) {
+		if (/[-_]\d{4,6}-of-\d{4,6}$/i.test(m.id)) continue;
+		if (lookupCaps(caps, m.id)?.lora) continue;
+		const k = matchKey(m.id);
+		if (manual.has(k)) continue; // models.json entry already covers this model
+		const prev = byKey.get(k);
+		if (!prev || (prev.id.includes("/") && !m.id.includes("/"))) byKey.set(k, m);
+	}
+
+	const models: ProviderModelConfig[] = [];
+	let skipped = 0;
+	for (const m of byKey.values()) {
+		const mc = toModelConfig(m, lookupCaps(caps, m.id), cfg);
+		if (!mc) {
+			skipped++;
+			continue;
+		}
+		models.push(mc);
+	}
 
 	const stats: Stats = {
 		total: models.length,
-		withContext: raw.filter((m) => pickContext(m, cfg) !== undefined).length,
+		withContext: models.length,
 		vision: models.filter((m) => m.input.includes("image")).length,
-		loaded: raw.filter((m) => m.loaded).length,
+		loaded: [...byKey.values()].filter((m) => m.loaded).length,
+		skipped,
 	};
 
 	const result: DiscoveryResult = { models, source: "live", updatedAt: new Date().toISOString(), stats };
@@ -291,16 +362,18 @@ async function discover(cfg: Cfg, signal?: AbortSignal): Promise<DiscoveryResult
 
 function formatReport(cfg: Cfg, result: DiscoveryResult, limit = 12): string {
 	const lines: string[] = [];
+	const models = dedupe(result.models, cfg);
 	lines.push(
 		`${cfg.provider} (${result.source}${result.updatedAt ? ` @ ${result.updatedAt}` : ""}) — ` +
-			`${result.stats.total} modelli, ${result.stats.withContext} con contesto rilevato, ` +
-			`${result.stats.vision} vision, ${result.stats.loaded} caricati.`,
+			`${models.length} modelli con contesto reale, ${result.stats.vision} vision, ` +
+			`${result.stats.loaded} caricati, ${result.stats.skipped ?? 0} saltati (nessun ctx: ` +
+			`aggiungi contextOverrides o entry in models.json).`,
 	);
-	const ranked = [...result.models].sort((a, b) => b.contextWindow - a.contextWindow).slice(0, limit);
+	const ranked = [...models].sort((a, b) => b.contextWindow - a.contextWindow).slice(0, limit);
 	for (const m of ranked) {
 		lines.push(`- ${m.name || m.id} — ctx ${m.contextWindow}${m.input.includes("image") ? " +vision" : ""}`);
 	}
-	if (result.models.length > limit) lines.push(`… altri ${result.models.length - limit} modelli`);
+	if (models.length > limit) lines.push(`… altri ${models.length - limit} modelli`);
 	return lines.join("\n");
 }
 
@@ -309,7 +382,7 @@ let last: DiscoveryResult | null = null;
 let busy = false;
 
 async function runSync(cfg: Cfg): Promise<DiscoveryResult> {
-	if (busy) return last ?? readCache(cfg) ?? { models: [], source: "cache", stats: { total: 0, withContext: 0, vision: 0, loaded: 0 } };
+	if (busy) return last ?? readCache(cfg) ?? { models: [], source: "cache", stats: { total: 0, withContext: 0, vision: 0, loaded: 0, skipped: 0 } };
 	busy = true;
 	try {
 		const result = await discover(cfg);
@@ -342,7 +415,7 @@ export default function (pi: ExtensionAPI) {
 		baseUrl: cfg.baseUrl,
 		apiKey: cfg.apiKey,
 		api: "openai-completions",
-		models: readCache(cfg)?.models ?? [],
+		models: dedupe(readCache(cfg)?.models ?? [], cfg),
 		async refreshModels(context: { allowNetwork?: boolean; signal?: AbortSignal }) {
 			if (!context?.allowNetwork) return readCache(cfg)?.models ?? [];
 			try {

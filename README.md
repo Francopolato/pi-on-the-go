@@ -42,13 +42,28 @@ This extension does that live, from the running Studio server:
 
 | Source | Fields read | Mapped to |
 |---|---|---|
-| `GET /v1/models` | `id`, `display_name`, `quant`, `loaded`, `context_length`, `max_context_length`, `native_context_length` | `contextWindow` (first present of `contextPreference`) |
+| `GET /v1/models` | `id`, `display_name`, `quant`, `loaded`, `context_length`, `max_context_length`, `native_context_length` | `contextWindow` (first present of `contextPreference`, then `contextOverrides[matchKey]`) |
 | `GET /api/models/list` | `is_vision`, `is_lora` | `input: ["text","image"]`; LoRA rows and GGUF shard rows (`-00001-of-00002`) are skipped |
 
 Manual entries already in `models.json` always win for the same model ID — pi composes
 `models.json` overrides above extension-registered models, so this file only adds new models
-and fills missing metadata. A cache (`~/.pi/agent/pi-on-the-go-cache.json`) is used when the
-server is offline.
+and fills missing metadata. The extension **never writes** `models.json`: its models live only
+in the runtime registry of the session. A cache (`~/.pi/agent/pi-on-the-go-cache.json`) is used
+when the server is offline.
+
+**Context rules — no invented numbers:**
+
+- context comes only from real fields: `contextPreference` order, then `contextOverrides[matchKey]`;
+- a model with no real context is **skipped** (not registered), never shown as a fake 32768; to keep it
+  visible give it a `models.json` entry or a `contextOverrides` value;
+- Studio exposes `context_length` only for **loaded** models, so unloaded ones need an override or a
+  manual entry.
+
+**No twins:** pi merges `models.json` entries by *exact* ID, so `X`, `X/file` and `X:quant` are three
+different IDs. The extension keys live rows by a normalized match key (path prefix and `:quant` suffix
+stripped, lowercased), collapses duplicate live rows of the same model into one entry, and skips any row
+whose key matches a manual entry — including entries in other provider blocks that resolve to this
+provider through `"provider": "unsloth"`.
 
 **Reachable without slash commands** (Telegram has no command palette):
 
