@@ -19,16 +19,17 @@
  *                   expose a thinking block unless the model is a reasoning model)
  *   maxTokens     = cfg.maxTokens (capped to contextWindow)
  *
- * Every live row is registered as a runtime clone named `<display_name><liveSuffix>`
- * (default `_live`), so a model loaded in Studio with custom parameters is visible and
- * selectable next to the manual `models.json` entry for the same model. The extension
- * never writes `models.json`; its models exist only in the runtime registry (session).
+ * Every live row is registered in a DEDICATED provider section (`liveProvider`, default
+ * `unsloth_live`) so a model loaded in Studio with custom parameters is selectable next to
+ * its manual `models.json` entry, distinguished by section rather than by name. The clone
+ * keeps the real server id as `id` — pi sends `model: model.id`, so suffixing the ID would
+ * break requests; ids can be identical across the two sections while the provider differs,
+ * which is what makes them distinguishable in /model.
  *
- * IMPORTANT: the clone keeps the real server id as `id` — pi sends `model: model.id` to
- * the OpenAI-compatible endpoint, so suffixing the ID would break requests. The `_live`
- * marker lives in `name` only. Duplicate live rows of the same model ("X" vs "X/file")
- * still collapse to one entry; when a live row has the exact same id as a manual entry,
- * pi merges them and the live values win.
+ * The manual section contains only the entries declared in `models.json` for this provider
+ * (own block + entries that resolve to it via "provider"); a model with no manual entry shows
+ * up only in the live section. Duplicate live rows ("X" vs "X/file") collapse to one entry.
+ * The extension never writes `models.json`: everything lives in the runtime registry (session).
  *
  * Reachable WITHOUT slash commands (Telegram has no command palette):
  *   - natural language: "aggiornamento unsloth", "aggiorna i modelli unsloth",
@@ -62,7 +63,7 @@ interface Cfg {
 	maxTokens: number;
 	contextPreference: string[];
 	contextOverrides: Record<string, number>;
-	liveSuffix: string;
+	liveProvider: string;
 }
 
 interface StudioModel {
@@ -109,7 +110,7 @@ const DEFAULTS: Cfg = {
 	maxTokens: 8192,
 	contextPreference: ["context_length", "native_context_length", "max_context_length", "max_position_embeddings"],
 	contextOverrides: {},
-	liveSuffix: "_live",
+	liveProvider: "unsloth_live",
 };
 
 // Natural-language triggers (Telegram has no slash commands). Matched only on short
@@ -181,19 +182,17 @@ function manualModels(cfg: Cfg): ProviderModelConfig[] {
 			if (!raw || typeof raw !== "object") continue;
 			const entry = raw as ProviderModelConfig & { provider?: string };
 			if (typeof entry.id !== "string") continue;
-			if (pname === cfg.provider || entry.provider === cfg.provider) out.push({ ...entry, provider: cfg.provider });
+			if (pname === cfg.provider || entry.provider === cfg.provider) {
+				out.push({
+					...entry,
+					provider: cfg.provider,
+					input: entry.input ?? ["text"],
+					cost: entry.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				});
+			}
 		}
 	}
 	return out;
-}
-
-// Manual entries + live clones; on an exact-id collision the live values win (that is the
-// point of the extension: pick up the custom context loaded in Studio).
-function compose(cfg: Cfg, live: ProviderModelConfig[]): ProviderModelConfig[] {
-	const byId = new Map<string, ProviderModelConfig>();
-	for (const m of manualModels(cfg)) byId.set(m.id, m);
-	for (const m of dedupe(live)) byId.set(m.id, m);
-	return [...byId.values()];
 }
 
 function loadConfig(): Cfg {
@@ -214,7 +213,7 @@ function loadConfig(): Cfg {
 	if (typeof userCfg.defaultReasoning === "boolean") cfg.defaultReasoning = userCfg.defaultReasoning;
 	if (typeof userCfg.maxTokens === "number") cfg.maxTokens = userCfg.maxTokens;
 	if (Array.isArray(userCfg.contextPreference)) cfg.contextPreference = userCfg.contextPreference;
-	if (typeof userCfg.liveSuffix === "string") cfg.liveSuffix = userCfg.liveSuffix;
+	if (typeof userCfg.liveProvider === "string") cfg.liveProvider = userCfg.liveProvider;
 	if (userCfg.contextOverrides && typeof userCfg.contextOverrides === "object") {
 		const ov: Record<string, number> = {};
 		for (const [k, v] of Object.entries(userCfg.contextOverrides)) {
@@ -290,7 +289,7 @@ function toModelConfig(m: StudioModel, caps: Capabilities | undefined, cfg: Cfg)
 	const input = caps?.vision ? ["text", "image"] : ["text"];
 	return {
 		id: m.id,
-		name: `${m.display_name || basename(normalizeModelKey(m.id)) || m.id}${cfg.liveSuffix}`,
+		name: m.display_name || basename(normalizeModelKey(m.id)) || m.id,
 		reasoning: cfg.defaultReasoning,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -379,8 +378,9 @@ function formatReport(cfg: Cfg, result: DiscoveryResult, limit = 12): string {
 	const lines: string[] = [];
 	const models = dedupe(result.models);
 	lines.push(
-		`${cfg.provider} (${result.source}${result.updatedAt ? ` @ ${result.updatedAt}` : ""}) — ` +
-			`${models.length} cloni live con contesto reale, ${result.stats.vision} vision, ` +
+		`sezione "${cfg.liveProvider}" (${result.source}${result.updatedAt ? ` @ ${result.updatedAt}` : ""}) — ` +
+			`${models.length} cloni live + ${manualModels(cfg).length} entry manuali in "${cfg.provider}", ` +
+			`${result.stats.vision} vision, ` +
 			`${result.stats.loaded} caricati, ${result.stats.skipped ?? 0} saltati (nessun ctx: ` +
 			`aggiungi contextOverrides o entry in models.json).`,
 	);
@@ -425,18 +425,28 @@ function isTrigger(text: string): boolean {
 export default function (pi: ExtensionAPI) {
 	const cfg = loadConfig();
 
-	// Live catalog from the running Studio server; cache used when offline.
+	// Manual section: exactly the entries declared in models.json for this provider.
 	pi.registerProvider(cfg.provider, {
 		baseUrl: cfg.baseUrl,
 		apiKey: cfg.apiKey,
 		api: "openai-completions",
-		models: compose(cfg, readCache(cfg)?.models ?? []),
+		models: manualModels(cfg),
+		refreshModels: () => manualModels(cfg),
+	});
+
+	// Live section: clones of the rows Studio exposes, with the values the server reports.
+	pi.registerProvider(cfg.liveProvider, {
+		name: `${cfg.provider} (live)`,
+		baseUrl: cfg.baseUrl,
+		apiKey: cfg.apiKey,
+		api: "openai-completions",
+		models: dedupe(readCache(cfg)?.models ?? []),
 		async refreshModels(context: { allowNetwork?: boolean; signal?: AbortSignal }) {
-			if (!context?.allowNetwork) return readCache(cfg)?.models ?? [];
+			if (!context?.allowNetwork) return dedupe(readCache(cfg)?.models ?? []);
 			try {
 				const result = await discover(cfg, context?.signal);
 				last = result;
-				return compose(cfg, result.models);
+				return dedupe(result.models);
 			} catch (err) {
 				console.error("[unsloth-sync] refreshModels:", err instanceof Error ? err.message : String(err));
 				return readCache(cfg)?.models ?? [];
