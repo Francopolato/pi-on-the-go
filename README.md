@@ -47,10 +47,11 @@ This extension does that live, from the running Studio server:
 
 The extension registers **two provider sections**:
 
-- `provider` (default `unsloth`) — exactly the entries declared in `models.json` for that provider
-  (own block plus entries that resolve to it through `"provider": "unsloth"`). pi's `applyExtension`
-  replaces the whole provider model list with what the extension returns, so these are re-included
-  explicitly or they would disappear.
+- `provider` (default `unsloth`) — exactly the entries declared in `models.json` **in that provider's
+  own block**. pi's `applyExtension` replaces the whole provider model list with what the extension
+  returns, so these are re-included explicitly or they would disappear. Entries declared in another
+  block (e.g. `single-gpu`) stay in their own section — copying them here as well would show the same
+  model twice.
 - `liveProvider` (default `unsloth_live`) — one clone per live row, carrying the values the server
   reports. Because `/model` shows the **ID**, manual and clone entries look identical; the section is
   what distinguishes them. A model with no manual entry appears only in the live section.

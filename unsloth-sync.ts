@@ -26,9 +26,11 @@
  * break requests; ids can be identical across the two sections while the provider differs,
  * which is what makes them distinguishable in /model.
  *
- * The manual section contains only the entries declared in `models.json` for this provider
- * (own block + entries that resolve to it via "provider"); a model with no manual entry shows
- * up only in the live section. Duplicate live rows ("X" vs "X/file") collapse to one entry.
+ * The manual section contains only the entries declared in `models.json` for this provider's OWN
+ * block. Entries declared in another provider block stay in that block's section — copying them here
+ * too would show the same model twice (that was the old cross-provider dedup rule, now dropped).
+ * A model with no manual entry shows up only in the live section. Duplicate live rows ("X" vs
+ * "X/file") collapse to one entry.
  * The extension never writes `models.json`: everything lives in the runtime registry (session).
  *
  * Reachable WITHOUT slash commands (Telegram has no command palette):
@@ -182,7 +184,8 @@ function manualModels(cfg: Cfg): ProviderModelConfig[] {
 			if (!raw || typeof raw !== "object") continue;
 			const entry = raw as ProviderModelConfig & { provider?: string };
 			if (typeof entry.id !== "string") continue;
-			if (pname === cfg.provider || entry.provider === cfg.provider) {
+			// own block only: other blocks already have their own provider section
+			if (pname === cfg.provider) {
 				out.push({
 					...entry,
 					provider: cfg.provider,
